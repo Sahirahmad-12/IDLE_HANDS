@@ -1,5 +1,5 @@
 from django.utils import timezone
-from Attendance.models import Enrollment, Attendence
+from FaceX.models import Enrollment, Attendence
 
 
 def mark_attendance(unique_id):
