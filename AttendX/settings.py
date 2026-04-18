@@ -21,7 +21,7 @@ SECRET_KEY = os.environ['SECRET_KEY']
 API_KEY = os.environ.get("INTERNAL_API_KEY", "")
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = False
+DEBUG = True
 
 ALLOWED_HOSTS = ["*"]
 
@@ -35,7 +35,7 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
-    'Attendance',
+    'FaceX',
     'cloudinary',
     'cloudinary_storage',
 ]
@@ -62,7 +62,7 @@ PASSWORD_HASHERS = [
 
 
 STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
-ROOT_URLCONF = 'FACE.urls'
+ROOT_URLCONF = 'AttendX.urls'
 
 TEMPLATES = [
     {
@@ -74,13 +74,13 @@ TEMPLATES = [
                 'django.template.context_processors.request',
                 'django.contrib.auth.context_processors.auth',
                 'django.contrib.messages.context_processors.messages',
-                'Attendance.context_processors.global_data'
+                'FaceX.context_processors.global_data'
             ],
         },
     }
 ]
 
-WSGI_APPLICATION = 'FACE.wsgi.application'
+WSGI_APPLICATION = 'AttendX.wsgi.application'
 
 # Cloudinary Setup
 

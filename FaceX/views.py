@@ -1,231 +1,503 @@
-from django.db import models
+import os
+import json
+import calendar
 
-# Create your models here.
-from django.db import models
-from django.contrib.auth.models import User
+from django.contrib.auth.decorators import login_required, user_passes_test
+from django.shortcuts import render, redirect
 from django.utils import timezone
-from cloudinary.models import CloudinaryField
-from django.db.models.signals import post_save, post_delete
-from django.dispatch import receiver
+from django.contrib import messages
+from django.contrib.auth import authenticate, login as auth_log, logout
+from django.contrib.auth.models import User
+from django.http import JsonResponse
+from django.views.decorators.csrf import csrf_exempt
 from django.core.cache import cache
-from datetime import timedelta
 
-# Create your models here.
+from cloudinary.utils import cloudinary_url
 
-class Contact(models.Model):
-    name = models.CharField(max_length=25)
-    email = models.EmailField()
-    phonenumber = models.CharField(max_length=10)
-    description = models.TextField()
-    timestamp = models.DateTimeField(auto_now_add=True, blank=True)
-
-    def __str__(self):
-        return self.name
+from FaceX.models import Contact, Enrollment, MembershipPlan, Trainer, Attendence, GymNotification
+from FaceX.rate_limit import check_login_attempt, reset_attempt ,record_failed_attempt
+from FaceX.attendance import mark_attendance
+from .forms import UserLogin
+from urllib.parse import urlparse
 
 
-class Trainer(models.Model):
-    GENDER_CHOICES = [
-        ('M', 'Male'),
-        ('F', 'Female'),
-        ('O', 'Other'),
-    ]
-    name = models.CharField(max_length=30)
-    gender = models.CharField(
-        max_length=1, choices=GENDER_CHOICES, default='M')
-    address = models.TextField()
-    phone = models.CharField(max_length=10)
-    salary = models.IntegerField()
-
-    def __str__(self):
-        return self.name
+# ==============================
+# API KEY (from environment)
+# ==============================
+INTERNAL_API_KEY = os.environ.get("INTERNAL_API_KEY", "")
 
 
-class MembershipPlan(models.Model):
-    plan = models.CharField(max_length=100)
-    price = models.IntegerField()
-    duration_days = models.IntegerField(default=30)
-
-    def __str__(self):
-        return f"{self.plan} - ₹{self.price}"
+# ==============================
+# STAFF CHECK
+# ==============================
+def is_staff(user):
+    return user.is_staff or user.is_superuser
 
 
-class Enrollment(models.Model):
-
-    # ==============================
-    # CHOICES
-    # ==============================
-    GENDER_CHOICES = [
-        ('M', 'Male'),
-        ('F', 'Female'),
-    ]
-
-    PAYMENT = [
-        ("Done", 'Done'),
-        ("Pending", 'Pending'),
-    ]
-
-    METHOD = [
-        ('C', 'CASH'),
-        ('U', 'UPI'),
-        ('B', 'UPI + CASH'),
-    ]
-
-    # ==============================
-    # BASIC INFO
-    # ==============================
-    unique_id = models.CharField(
-        max_length=4, unique=True, editable=False, db_index=True
-    )
-
-    user = models.OneToOneField(User, on_delete=models.CASCADE)
-
-    fullname = models.CharField(max_length=25)
-    email = models.EmailField()
-    gender = models.CharField(max_length=1, choices=GENDER_CHOICES)
-    phone = models.CharField(max_length=10, db_index=True)
-    dob = models.DateField()
-
-    address = models.TextField()
-    reference = models.CharField(max_length=30, null=True, blank=True)
-
-    # ==============================
-    # MEMBERSHIP
-    # ==============================
-    selectPlan = models.ForeignKey(MembershipPlan, on_delete=models.CASCADE)
-    trainer = models.ForeignKey(
-        Trainer, on_delete=models.SET_NULL, null=True, blank=True
-    )
-
-    paymentStatus = models.CharField(
-        max_length=10, choices=PAYMENT, default="Pending"
-    )
-    Amount = models.DecimalField(max_digits=10, decimal_places=2)
-    pendingAmount = models.DecimalField(default=0,max_digits=10,decimal_places=2)
-    paymentMethod = models.CharField(
-        max_length=1, choices=METHOD, blank=True, null=True
-    )
-
-    # ==============================
-    # DATES
-    # ==============================
-    doj = models.DateField(auto_now_add=True)
-    DueDate = models.DateField(blank=True, null=True)
-    created_at = models.DateTimeField(auto_now_add=True)
-
-    # ==============================
-    # 🔥 FACE SYSTEM (CLEAN)
-    # ==============================
-    face_enrolled = models.BooleanField(default=False)
-
-    # Profile image
-    face_image = CloudinaryField('image', null=True, blank=True)
-
-    # Multiple embeddings
-    face_embeddings = models.JSONField(default=list, blank=True)
-
-    # ==============================
-    # UNIQUE ID GENERATOR
-    # ==============================
-    def generate_unique_id(self):
-        import random
-        while True:
-            uid = str(random.randint(1000, 9999))
-            if not Enrollment.objects.filter(unique_id=uid).exists():
-                return uid
-
-    # ==============================
-    # SAVE METHOD (CLEAN)
-    # ==============================
-    def save(self, *args, **kwargs):
-
-        # Generate unique ID
-        if not self.unique_id:
-            self.unique_id = self.generate_unique_id()
-
-        # Set amount automatically
-        if self.selectPlan:
-            self.Amount = self.selectPlan.price
-
-            if not self.DueDate and self.selectPlan.duration_days:
-                today = timezone.now().date()
-                self.DueDate = today + timedelta(days=self.selectPlan.duration_days)
-
-        super().save(*args, **kwargs)
-
-    # ==============================
-    # EXPIRY LOGIC
-    # ==============================
-    @property
-    def is_expired(self):
-        if self.DueDate:
-            return timezone.now().date() >= self.DueDate
-        return False
-
-    @property
-    def days_remaining(self):
-        if self.DueDate:
-            return (self.DueDate - timezone.now().date()).days
-        return None
-
-    def __str__(self):
-        return f"{self.unique_id} - {self.fullname}"
+# ==============================
+# GET CLIENT IP
+# ==============================
+def get_client_ip(request):
+    forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
+    if forwarded_for:
+        ip = forwarded_for.split(',')[0].strip()
+    else:
+        ip = request.META.get('REMOTE_ADDR')
+    return ip
 
 
-class Attendence(models.Model):
-    user = models.ForeignKey(User, on_delete=models.CASCADE)
-    date = models.DateField(default=timezone.localdate)
-    timestamp = models.TimeField(auto_now_add=True)
+# ==============================
+# SAVE EMBEDDING (STAFF ONLY)
+# ==============================
+@csrf_exempt
+def save_embeddings_batch(request):
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
 
-    class Meta:
-        unique_together = ('user', 'date')
+    try:
+        data = json.loads(request.body)
 
-    def __str__(self):
-        if hasattr(self.user, "enrollment"):
-            return f"{self.user.enrollment.unique_id}"
-        return f"{self.user.username} - {self.date}"
+        if not INTERNAL_API_KEY or data.get("api_key") != INTERNAL_API_KEY:
+            return JsonResponse({"error": "Unauthorized"}, status=403)
 
-class GymNotification(models.Model):
+        unique_id = data.get("unique_id")
+        embeddings = data.get("embeddings", [])
+
+        if not unique_id or not embeddings:
+            return JsonResponse({"error": "Missing data"}, status=400)
+
+        enrollment = Enrollment.objects.get(unique_id=unique_id)
+
+        if not enrollment.face_embeddings:
+            enrollment.face_embeddings = []
+
+        MAX_EMB = 7
+        for emb in embeddings:
+            if len(enrollment.face_embeddings) >= MAX_EMB:
+                enrollment.face_embeddings.pop(0)
+            enrollment.face_embeddings.append(emb)
+
+        enrollment.face_enrolled = True
+        enrollment.save()
+
+        return JsonResponse({
+            "status": "success",
+            "total_embeddings": len(enrollment.face_embeddings)
+        })
+
+    except Enrollment.DoesNotExist:
+        return JsonResponse({"error": "User not found"}, status=404)
+    except Exception as e:
+        return JsonResponse({"error": str(e)}, status=500)
+
+
+# ==============================
+# SIGNUP PAGE
+# ==============================
+def signupPage(request):
+    # Redirect already authenticated users
+    if request.user.is_authenticated:
+        return redirect('/')
+
+    if request.method == "POST":
+        form = UserLogin(request.POST)
+        if form.is_valid():
+            user = form.save()
+            auth_log(request, user)
+            messages.success(request, "Account created successfully!")
+            return redirect('/')
+    else:
+        form = UserLogin()
+
+    return render(request, 'registration/signup.html', {'form': form})
+
+
+# ==============================
+# LOGIN PAGE
+# ==============================
+def loginPage(request):
+    if request.user.is_authenticated:
+        return redirect('/')
+
+    next_url = request.GET.get('next') or request.POST.get('next', '/')
+
+    if request.method == "POST":
+        ip = get_client_ip(request)
+        phone = request.POST.get('username', '').strip()
+        password = request.POST.get('password', '')
+
+        # ✅ Only check if locked out — don't increment yet
+        if not check_login_attempt(ip, phone):
+            messages.error(
+                request, "Too many failed login attempts. Please try again later.")
+            return redirect(f'/login/?next={next_url}')
+
+        user = authenticate(request, username=phone, password=password)
+
+        if user is not None:
+            reset_attempt(ip, phone)
+            auth_log(request, user)
+            messages.success(request, "Logged in successfully!")
+            return redirect(_safe_next(next_url, request))
+        else:
+            record_failed_attempt(ip, phone)   # ✅ Only increment on failure
+            messages.error(request, "Incorrect phone number or password.")
+            return redirect(f'/login/?next={next_url}')
+
+    return render(request, 'registration/login.html', {'next': next_url})
+
+
+def _safe_next(next_url: str, request) -> str:
     """
-    Admin-managed notification ticker on the homepage.
-    Each active entry scrolls across the notification bar.
+    Allow only same-origin redirects to prevent open-redirect attacks.
+    Falls back to '/' for external or malformed URLs.
     """
-    ICON_CHOICES = [
-        ("🎉", "🎉 Party / Offer"),
-        ("💪", "💪 Training"),
-        ("🏖️", "🏖️ Summer / Season"),
-        ("⚡", "⚡ Alert / Closure"),
-        ("🏷️", "🏷️ Deal / Discount"),
-        ("📢", "📢 Announcement"),
-        ("", "No icon"),
-    ]
-
-    icon = models.CharField(
-        max_length=5, choices=ICON_CHOICES, blank=True, default="📢")
-    message = models.CharField(
-        max_length=200, help_text="Short notification text (max 200 chars)")
-    is_active = models.BooleanField(
-        default=True, help_text="Uncheck to hide from homepage")
-    created_at = models.DateTimeField(auto_now_add=True)
-    order = models.PositiveSmallIntegerField(
-        default=0, help_text="Lower number = shows first")
-
-    class Meta:
-        ordering = ["order", "created_at"]
-        verbose_name = "Gym Notification"
-        verbose_name_plural = "Gym Notifications"
-
-    def __str__(self):
-        return f"{self.icon} {self.message[:60]}"
-    
-@receiver([post_save, post_delete], sender=Enrollment)
-def clear_enrollment_cache(sender, instance, **kwargs):
-    cache.delete("admin_revenue")
-    cache.delete("face_users")
-    cache.delete(f"enrollment_{instance.user.id}")
-    cache.delete(f"profile_image_{instance.user.id}")
-    cache.delete(f"enrolled_{instance.user.id}")
+    parsed = urlparse(next_url)
+    if parsed.netloc and parsed.netloc != request.get_host():
+        return '/'
+    return next_url or '/'
 
 
-@receiver([post_save, post_delete], sender=GymNotification)
-def clear_notification_cache(sender, **kwargs):
-    cache.delete("notifications")
+# ==============================
+# CACHE DEBUG (dev only)
+# ==============================
+def cache_debug(request):
+    cache.set("test_key", "working", timeout=30)
+    val = cache.get("test_key")
+    return JsonResponse({
+        "cache_backend": str(type(cache._cache)),
+        "test_value": val,
+    })
+
+
+# ==============================
+# MARK ATTENDANCE API
+# ==============================
+@csrf_exempt
+def mark_attendance_api(request):
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+
+    try:
+        data = json.loads(request.body)
+
+        if not INTERNAL_API_KEY or data.get("api_key") != INTERNAL_API_KEY:
+            return JsonResponse({"error": "Unauthorized"}, status=403)
+
+        unique_id = data.get("unique_id")
+        if not unique_id:
+            return JsonResponse({"error": "Missing unique_id"}, status=400)
+
+        result = mark_attendance(unique_id)
+        return JsonResponse(result)
+
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+    except Exception as e:
+        return JsonResponse({"error": str(e)}, status=500)
+
+
+# ==============================
+# GET USERS (face embeddings)
+# ==============================
+def get_users(request):
+    data = cache.get("face_users")
+    if data is None:
+        enrollments = Enrollment.objects.filter(face_embeddings__isnull=False)
+        data = [
+            {
+                "unique_id": u.unique_id,
+                "name": u.fullname,
+                "embeddings": u.face_embeddings,
+            }
+            for u in enrollments
+        ]
+        cache.set("face_users", data, timeout=300)
+    return JsonResponse(data, safe=False)
+
+
+# ==============================
+# UPLOAD FACE IMAGE
+# ==============================
+@csrf_exempt
+def upload_face_image(request):
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+
+    try:
+        api_key = request.POST.get("api_key")
+        if not INTERNAL_API_KEY or api_key != INTERNAL_API_KEY:
+            return JsonResponse({"error": "Unauthorized"}, status=403)
+
+        unique_id = request.POST.get("unique_id")
+        face_image = request.FILES.get("face_image")
+
+        if not unique_id or not face_image:
+            return JsonResponse({"error": "Missing data"}, status=400)
+
+        enrollment = Enrollment.objects.get(unique_id=unique_id)
+        enrollment.face_image = face_image  # Cloudinary handles upload
+        enrollment.save()
+
+        cache.delete(f"profile_image_{enrollment.user.id}")
+        cache.delete(f"enrollment_{enrollment.user.id}")
+
+        return JsonResponse({"status": "success", "image_url": enrollment.face_image.url})
+
+    except Enrollment.DoesNotExist:
+        return JsonResponse({"error": "User not found"}, status=404)
+    except Exception as e:
+        return JsonResponse({"error": str(e)}, status=500)
+
+
+# ==============================
+# HOME PAGE
+# ==============================
+def homePage(request):
+    enrolled = False
+    isStaff = False
+    isSuperuser = False
+
+    gym_notifications = cache.get("notifications")
+    if gym_notifications is None:
+        gym_notifications = list(
+            GymNotification.objects.filter(
+                is_active=True).values("icon", "message")
+        )
+        cache.set("notifications", gym_notifications, timeout=3600)
+
+    if request.user.is_authenticated:
+        isStaff = request.user.is_staff
+        isSuperuser = request.user.is_superuser
+
+        enrolled = cache.get(f"enrolled_{request.user.id}")
+        if enrolled is None:
+            enrolled = Enrollment.objects.filter(user=request.user).exists()
+            cache.set(f"enrolled_{request.user.id}", enrolled, timeout=300)
+
+    return render(request, "home.html", {
+        "enrolled": enrolled,
+        "isStaff": isStaff,
+        "isSuperuser": isSuperuser,
+        "gym_notifications": gym_notifications,
+    })
+
+
+# ==============================
+# STATS API
+# ==============================
+def stats_api(request):
+    total_users = Enrollment.objects.count()
+    return JsonResponse({"total_users": total_users})
+
+
+# ==============================
+# CONTACT PAGE
+# ==============================
+def contact(request):
+    if request.method == "POST":
+        name = request.POST.get('name', '').strip()
+        number = request.POST.get('number', '').strip()
+        email = request.POST.get('email', '').strip()
+        message = request.POST.get('description', '').strip()
+
+        # ✅ Validate: exactly 10 digits, numeric only
+        if not number.isdigit() or len(number) != 10:
+            messages.error(
+                request, "Please enter a valid 10-digit phone number.")
+            return redirect('/contact/')
+
+        query = Contact(
+            name=name,
+            email=email,
+            phonenumber=number,
+            description=message
+        )
+        query.save()
+        messages.success(
+            request, "Thanks for contacting us — we'll get back to you soon!")
+        return redirect('/contact/')
+
+    return render(request, 'contact.html')
+
+
+# ==============================
+# LOGOUT
+# ==============================
+def handlelogout(request):
+    logout(request)
+    messages.success(request, "Logged out successfully.")
+    return redirect('/')
+
+
+# ==============================
+# ENROLLMENT
+# ==============================
+@login_required
+def enrollment(request):
+    # Redirect if already enrolled
+    if Enrollment.objects.filter(user=request.user).exists():
+        return redirect('/profile/')
+
+    plans = MembershipPlan.objects.all()
+    trainers = Trainer.objects.all()
+
+    if request.method == "POST":
+        name = request.POST.get('name', '').strip()
+        email = request.POST.get('email', '').strip()
+        phone = request.POST.get('phone', '').strip()
+        gender = request.POST.get('gender')
+        dob = request.POST.get('dob')
+        plan_id = request.POST.get('plan')
+        trainer_id = request.POST.get('trainer')
+        reference = request.POST.get('reference', '').strip()
+        address = request.POST.get('address', '').strip()
+
+        selected_trainer = None
+        if trainer_id and trainer_id.lower() != 'none':
+            try :
+                selected_trainer = Trainer.objects.get(id=trainer_id)
+            except Trainer.DoesNotExist:
+                messages.error(request, "Selected trainer does not exist.")
+                return redirect('/enrollment/')
+
+        try:
+            selected_plan = MembershipPlan.objects.get(id=plan_id)
+        except MembershipPlan.DoesNotExist:
+            messages.error(request, "Selected plan does not exist.")
+            return redirect('/enrollment/')
+
+        enroll = Enrollment(
+            fullname=name,
+            email=email,
+            phone=phone,
+            dob=dob,
+            selectPlan=selected_plan,
+            trainer=selected_trainer,
+            gender=gender,
+            reference=reference,
+            address=address,
+            user=request.user,
+        )
+        enroll.save()
+
+        # Clear relevant caches
+        cache.delete(f"enrollment_{request.user.id}")
+        cache.delete(f"profile_image_{request.user.id}")
+        cache.delete(f"enrolled_{request.user.id}")
+
+        messages.success(
+            request,
+            "Welcome aboard! Your gym membership has been successfully activated."
+        )
+        return redirect('/profile/')
+
+    return render(request, 'membership.html', {
+        "plans": plans,
+        "trainers": trainers,
+    })
+
+
+# ==============================
+# WORKOUT PAGE
+# ==============================
+def workout(request):
+    return render(request, 'workout.html')
+
+
+# ==============================
+# 👤 PROFILE PAGE
+# ==============================
+@login_required
+def Profile(request):
+    enrollment = cache.get(f"enrollment_{request.user.id}")
+    if enrollment is None:
+        enrollment = Enrollment.objects.filter(user=request.user).first()
+        cache.set(f"enrollment_{request.user.id}", enrollment, timeout=300)
+
+    image_url = None
+    if enrollment and enrollment.face_image:
+        image_url = cache.get(f"profile_image_{request.user.id}")
+        if image_url is None:
+            image_url, _ = cloudinary_url(
+                enrollment.face_image.public_id,
+                width=130,
+                height=130,
+                crop="fill",
+            )
+            cache.set(f"profile_image_{request.user.id}",
+                      image_url, timeout=300)
+
+    return render(request, 'profile.html', {
+        'enrollment': enrollment,
+        'image_url': image_url,
+        'is_expired': enrollment.is_expired if enrollment else False,
+        'days_remaining': enrollment.days_remaining if enrollment else 0,
+    })
+
+
+# ==============================
+# ATTENDANCE PAGE
+# ==============================
+@login_required  # ✅ Fixed: was missing login_required
+def attendence(request):
+    today = timezone.localdate()
+    user = request.user
+
+    already_mark = Attendence.objects.filter(user=user, date=today).exists()
+
+    if request.method == "POST":
+        obj, created = Attendence.objects.get_or_create(user=user, date=today)
+
+        if created:
+            messages.success(request, "Attendance successfully marked.")
+        else:
+            messages.error(request, "Attendance already marked today.")
+
+        return redirect('/attendence/')
+
+    all_attended = list(Attendence.objects.filter(user=user).order_by('-date'))
+    attended = all_attended[:7]
+    total_days = len(all_attended)
+    monthly_days = calendar.monthrange(today.year, today.month)[1]
+
+    return render(request, 'attendance.html', {
+        'already_mark': already_mark,
+        'attended': attended,
+        'total_days': total_days,
+        'monthly_days': monthly_days,
+        'today': today,
+    })
+
+def trialPage(request):
+    return render(request,'trial.html')
+def aboutPage(request):
+    return render(request,'about.html')
+def basePage(request):
+    enrolled = False
+    isStaff = False
+    isSuperuser = False
+
+    gym_notifications = cache.get("notifications")
+    if gym_notifications is None:
+        gym_notifications = list(
+            GymNotification.objects.filter(
+                is_active=True).values("icon", "message")
+        )
+        cache.set("notifications", gym_notifications, timeout=3600)
+
+    if request.user.is_authenticated:
+        isStaff = request.user.is_staff
+        isSuperuser = request.user.is_superuser
+
+        enrolled = cache.get(f"enrolled_{request.user.id}")
+        if enrolled is None:
+            enrolled = Enrollment.objects.filter(user=request.user).exists()
+            cache.set(f"enrolled_{request.user.id}", enrolled, timeout=300)
+
+    return render(request, "base.html", {
+        "enrolled": enrolled,
+        "isStaff": isStaff,
+        "isSuperuser": isSuperuser,
+        "gym_notifications": gym_notifications,
+    })
